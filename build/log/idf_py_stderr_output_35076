@@ -1,0 +1,5 @@
+CMake Error at CMakeLists.txt:5 (add_executable):
+  No SOURCES given to target: buggy_sw
+
+
+CMake Generate step failed.  Build files cannot be regenerated correctly.
