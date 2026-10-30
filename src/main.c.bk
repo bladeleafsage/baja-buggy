@@ -1,0 +1,152 @@
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include "driver/gpio.h"
+#include "esp_err.h"
+#include "esp_task_wdt.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "driver/uart.h"
+
+#define MOTOR_IN1_PIN 32
+#define MOTOR_IN2_PIN 33
+#define CONTROL_LOOP_PERIOD_MS 2.5f
+#define CONTROL_LOOP_FREQ 400
+#define INPUT_TIMEOUT_MS 100
+
+typedef struct {
+    int8_t direction;
+    uint32_t timestamp_ms;
+} control_state_t;
+
+static control_state_t control_state = {0, 0};
+static SemaphoreHandle_t control_mutex = NULL;
+
+void motor_init(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << MOTOR_IN1_PIN) | (1ULL << MOTOR_IN2_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+}
+
+void motor_set_direction(int direction) {
+    if (direction > 0) {
+        gpio_set_level(MOTOR_IN1_PIN, 1);
+        gpio_set_level(MOTOR_IN2_PIN, 0);
+    } else if (direction < 0) {
+        gpio_set_level(MOTOR_IN1_PIN, 0);
+        gpio_set_level(MOTOR_IN2_PIN, 1);
+    } else {
+        gpio_set_level(MOTOR_IN1_PIN, 0);
+        gpio_set_level(MOTOR_IN2_PIN, 0);
+    }
+}
+
+void update_control_state(int8_t direction) {
+    if (xSemaphoreTake(control_mutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+        control_state.direction = direction;
+        control_state.timestamp_ms = xTaskGetTickCount() / portTICK_PERIOD_MS;
+        xSemaphoreGive(control_mutex);
+    }
+}
+
+int8_t get_control_direction(void) {
+    int8_t dir = 0;
+    if (xSemaphoreTake(control_mutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+        uint32_t current_time_ms = xTaskGetTickCount() / portTICK_PERIOD_MS;
+        uint32_t time_since_input = current_time_ms - control_state.timestamp_ms;
+
+        if (time_since_input > INPUT_TIMEOUT_MS) {
+            dir = 0;
+        } else {
+            dir = control_state.direction;
+        }
+        xSemaphoreGive(control_mutex);
+    }
+    return dir;
+}
+
+void process_serial_input(char c) {
+    if (c == 'w' || c == 'W') {
+        update_control_state(1);
+        printf("F");
+    } else if (c == 's' || c == 'S') {
+        update_control_state(-1);
+        printf("R");
+    } else if (c == ' ') {
+        update_control_state(0);
+        printf("S");
+    } else if (c == '\n' || c == '\r') {
+        printf("\n");
+    }
+    fflush(stdout);
+}
+
+void control_loop_task(void *pvParameters) {
+    esp_task_wdt_add(NULL);
+    int8_t last_direction = 0;
+
+    printf("Control loop started (timeout: %dms)\n", INPUT_TIMEOUT_MS);
+
+    while (1) {
+        int8_t current_direction = get_control_direction();
+
+        if (current_direction != last_direction && current_direction == 0) {
+            printf("Motor stopped (input timeout)\n");
+        }
+
+        motor_set_direction(current_direction);
+        last_direction = current_direction;
+
+        esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void serial_input_task(void *pvParameters) {
+    esp_task_wdt_add(NULL);
+    printf("Serial input task started\n");
+    printf("Controls: W=forward, S=reverse, SPACE=stop\n> ");
+    fflush(stdout);
+
+    while (1) {
+        int c = getchar();
+        if (c != EOF) {
+            process_serial_input(c);
+        }
+
+        esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+void app_main() {
+    int init_cnt = 0;
+    while (init_cnt < 5) {
+        printf("Wake count: %d\n", init_cnt);
+        init_cnt++;
+        sleep(1);
+    }
+
+    printf("Initializing L298N motor controller\n");
+    motor_init();
+
+    control_mutex = xSemaphoreCreateMutex();
+    if (control_mutex == NULL) {
+        printf("Failed to create mutex\n");
+        return;
+    }
+
+    printf("Creating control loop task (400Hz)\n");
+    xTaskCreate(control_loop_task, "control_loop", 2048, NULL, 5, NULL);
+
+    printf("Creating serial input task\n");
+    xTaskCreate(serial_input_task, "serial_input", 2048, NULL, 4, NULL);
+
+    vTaskDelete(NULL);
+}
