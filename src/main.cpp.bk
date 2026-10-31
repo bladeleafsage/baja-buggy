@@ -1,0 +1,375 @@
+#include <cstdio>
+#include <cstdint>
+#include <unistd.h>
+#include <cstring>
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "esp_err.h"
+#include "esp_task_wdt.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+constexpr gpio_num_t MOTOR_IN1_PIN = GPIO_NUM_32;
+constexpr gpio_num_t MOTOR_IN2_PIN = GPIO_NUM_33;
+constexpr uint32_t INPUT_TIMEOUT_MS = 100;
+constexpr uint32_t CONTROL_LOOP_DELAY_MS = 2;
+constexpr uint32_t SERIAL_INPUT_DELAY_MS = 10;
+constexpr uart_port_t UART_PORT = UART_NUM_0;
+constexpr int UART_BAUD = 115200;
+constexpr int UART_RX_BUF_SIZE = 256;
+constexpr int UART_TX_BUF_SIZE = 256;
+
+enum class MotorDirection : int8_t {
+    STOP = 0,
+    FORWARD = 1,
+    REVERSE = -1
+};
+
+class MotorController {
+private:
+    gpio_num_t pin_in1;
+    gpio_num_t pin_in2;
+    MotorDirection current_direction = MotorDirection::STOP;
+
+public:
+    MotorController(gpio_num_t in1, gpio_num_t in2) : pin_in1(in1), pin_in2(in2) {}
+
+    void init() {
+        gpio_config_t io_conf = {
+            .pin_bit_mask = (1ULL << pin_in1) | (1ULL << pin_in2),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io_conf);
+    }
+
+    void set_direction(MotorDirection direction) {
+        current_direction = direction;
+        if (direction == MotorDirection::FORWARD) {
+            gpio_set_level(pin_in1, 1);
+            gpio_set_level(pin_in2, 0);
+        } else if (direction == MotorDirection::REVERSE) {
+            gpio_set_level(pin_in1, 0);
+            gpio_set_level(pin_in2, 1);
+        } else {
+            gpio_set_level(pin_in1, 0);
+            gpio_set_level(pin_in2, 0);
+        }
+    }
+
+    const char* get_status() const {
+        static char status_buffer[128];
+        const char* dir_str = "UNKNOWN";
+        if (current_direction == MotorDirection::FORWARD) {
+            dir_str = "FORWARD";
+        } else if (current_direction == MotorDirection::REVERSE) {
+            dir_str = "REVERSE";
+        } else {
+            dir_str = "STOP";
+        }
+        snprintf(status_buffer, sizeof(status_buffer),
+                 "[Motor] Direction: %s | IN1: %u | IN2: %u",
+                 dir_str,
+                 (unsigned)gpio_get_level(pin_in1),
+                 (unsigned)gpio_get_level(pin_in2));
+        return status_buffer;
+    }
+};
+
+class ControlState {
+private:
+    struct State {
+        MotorDirection direction = MotorDirection::STOP;
+        uint32_t timestamp_ms = 0;
+    } state;
+
+    SemaphoreHandle_t mutex;
+
+public:
+    ControlState() {
+        mutex = xSemaphoreCreateMutex();
+    }
+
+    ~ControlState() {
+        if (mutex != NULL) {
+            vSemaphoreDelete(mutex);
+        }
+    }
+
+    void update(MotorDirection direction) {
+        if (xSemaphoreTake(mutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+            state.direction = direction;
+            state.timestamp_ms = xTaskGetTickCount() / portTICK_PERIOD_MS;
+            xSemaphoreGive(mutex);
+        }
+    }
+
+    MotorDirection get_direction() {
+        MotorDirection dir = MotorDirection::STOP;
+        if (xSemaphoreTake(mutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+            uint32_t current_time_ms = xTaskGetTickCount() / portTICK_PERIOD_MS;
+            uint32_t time_since_input = current_time_ms - state.timestamp_ms;
+
+            if (time_since_input >= INPUT_TIMEOUT_MS) {
+                dir = MotorDirection::STOP;
+            } else {
+                dir = state.direction;
+            }
+            xSemaphoreGive(mutex);
+        }
+        return dir;
+    }
+
+    uint32_t get_timestamp() {
+        uint32_t ts = 0;
+        if (xSemaphoreTake(mutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+            ts = state.timestamp_ms;
+            xSemaphoreGive(mutex);
+        }
+        return ts;
+    }
+
+    const char* get_status() const {
+        static char status_buffer[256];
+        MotorDirection dir = MotorDirection::STOP;
+        uint32_t current_time_ms = xTaskGetTickCount() / portTICK_PERIOD_MS;
+        uint32_t time_since_input = 0;
+
+        if (xSemaphoreTake(mutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+            dir = state.direction;
+            time_since_input = current_time_ms - state.timestamp_ms;
+            xSemaphoreGive(mutex);
+        }
+
+        const char* dir_str = "UNKNOWN";
+        if (dir == MotorDirection::FORWARD) {
+            dir_str = "FORWARD";
+        } else if (dir == MotorDirection::REVERSE) {
+            dir_str = "REVERSE";
+        } else {
+            dir_str = "STOP";
+        }
+
+        snprintf(status_buffer, sizeof(status_buffer),
+                 "[Control] Direction: %s | Time Since Input: %lu ms",
+                 dir_str,
+                 (unsigned long)time_since_input);
+        return status_buffer;
+    }
+};
+
+class InputHandler {
+public:
+    virtual ~InputHandler() = default;
+    virtual void init() = 0;
+    virtual void process() = 0;
+    virtual const char* get_status() const = 0;
+    virtual void print_status() const = 0;
+};
+
+class SerialInputHandler : public InputHandler {
+private:
+    ControlState* control_state;
+    char last_input;
+    uint32_t last_input_time;
+    bool timeout_active;
+
+    static const char* direction_to_string(MotorDirection dir) {
+        switch (dir) {
+            case MotorDirection::FORWARD:
+                return "FORWARD";
+            case MotorDirection::REVERSE:
+                return "REVERSE";
+            case MotorDirection::STOP:
+                return "STOP";
+            default:
+                return "UNKNOWN";
+        }
+    }
+
+public:
+    SerialInputHandler(ControlState* state)
+        : control_state(state), last_input('\0'), last_input_time(0), timeout_active(false) {}
+
+    void init() override {
+
+        uart_config_t uart_config = {}; // Zero-initialize every single field first
+        uart_config.baud_rate = 115200;
+        uart_config.data_bits = UART_DATA_8_BITS;
+        uart_config.parity    = UART_PARITY_DISABLE;
+        uart_config.stop_bits = UART_STOP_BITS_1;
+        uart_config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+        uart_config.source_clk = UART_SCLK_DEFAULT;
+
+
+        uart_driver_install(UART_PORT, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, 0, NULL, 0);
+        uart_param_config(UART_PORT, &uart_config);
+        uart_set_pin(UART_PORT, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+        printf("Serial input handler initialized (UART %d at %d baud)\n", UART_PORT, UART_BAUD);
+        print_status();
+    }
+
+    void process() override {
+        uint8_t buffer[64];
+        int length = uart_read_bytes(UART_PORT, buffer, sizeof(buffer), pdMS_TO_TICKS(1));
+
+        for (int i = 0; i < length; i++) {
+            char c = static_cast<char>(buffer[i]);
+            process_input(c);
+        }
+
+        check_timeout();
+    }
+
+    const char* get_status() const override {
+        static char status_buffer[256];
+
+        if (last_input == '\0') {
+            snprintf(status_buffer, sizeof(status_buffer),
+                     "Serial Handler: No input yet");
+        } else {
+            uint32_t current_time = xTaskGetTickCount() / portTICK_PERIOD_MS;
+            uint32_t elapsed = current_time - last_input_time;
+
+            snprintf(status_buffer, sizeof(status_buffer),
+                     "Last Input: '%c' | Direction: %s | Elapsed: %lu ms | Timestamp: %lu ms",
+                     last_input,
+                     direction_to_string(control_state->get_direction()),
+                     (unsigned long)elapsed,
+                     (unsigned long)control_state->get_timestamp());
+        }
+
+        return status_buffer;
+    }
+
+    void print_status() const override {
+        printf("%s\n", get_status());
+    }
+
+private:
+    void check_timeout() {
+        if (last_input == '\0') {
+            return;
+        }
+
+        uint32_t current_time = xTaskGetTickCount() / portTICK_PERIOD_MS;
+        uint32_t time_since_input = current_time - last_input_time;
+
+        if (time_since_input > INPUT_TIMEOUT_MS) {
+            timeout_active = true;
+        } else {
+            timeout_active = false;
+        }
+    }
+
+    void process_input(char c) {
+        last_input = c;
+        last_input_time = xTaskGetTickCount() / portTICK_PERIOD_MS;
+        timeout_active = false;
+
+        if (c == 'w' || c == 'W') {
+            control_state->update(MotorDirection::FORWARD);
+        } else if (c == 's' || c == 'S') {
+            control_state->update(MotorDirection::REVERSE);
+        } else if (c == ' ') {
+            control_state->update(MotorDirection::STOP);
+        }
+    }
+};
+
+static MotorController* motor_controller = nullptr;
+static ControlState* control_state = nullptr;
+static InputHandler* input_handler = nullptr;
+
+void control_loop_task(void* pvParameters) {
+    esp_task_wdt_add(NULL);
+    MotorDirection last_direction = MotorDirection::STOP;
+
+    printf("Control loop started (timeout: %lu ms)\n", (unsigned long)INPUT_TIMEOUT_MS);
+
+    while (1) {
+        MotorDirection current_direction = control_state->get_direction();
+
+        if (current_direction != last_direction && current_direction == MotorDirection::STOP) {
+            printf("Motor stopped (input timeout)\n");
+        }
+
+        motor_controller->set_direction(current_direction);
+        last_direction = current_direction;
+
+        esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(CONTROL_LOOP_DELAY_MS));
+    }
+}
+
+void serial_input_task(void* pvParameters) {
+    esp_task_wdt_add(NULL);
+    printf("Serial input task started\n");
+    printf("Controls: W=forward, S=reverse, SPACE=stop, No input=motor stops\n\n");
+    fflush(stdout);
+
+    while (1) {
+        input_handler->process();
+
+        esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(SERIAL_INPUT_DELAY_MS));
+    }
+}
+
+void status_display_task(void* pvParameters) {
+    esp_task_wdt_add(NULL);
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    printf("Status display task started\n\n");
+
+    while (1) {
+        printf("\r=== System Status ===\n");
+        printf("%s\n", input_handler->get_status());
+        printf("%s\n", control_state->get_status());
+        printf("%s\n", motor_controller->get_status());
+        printf("====================\n\n");
+        fflush(stdout);
+
+        esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+extern "C" void app_main() {
+    int init_cnt = 0;
+    while (init_cnt < 5) {
+        printf("Wake count: %d\n", init_cnt);
+        init_cnt++;
+        sleep(1);
+    }
+    printf("Initializing L298N motor controller (C++)\n");
+
+    motor_controller = new MotorController(MOTOR_IN1_PIN, MOTOR_IN2_PIN);
+    motor_controller->init();
+
+    control_state = new ControlState();
+
+    input_handler = new SerialInputHandler(control_state);
+    input_handler->init();
+
+    printf("Creating control loop task (CPU 0)\n");
+    fflush(stdout);
+    xTaskCreatePinnedToCore(control_loop_task, "control_loop", 2048, NULL, 5, NULL, 0);
+
+    printf("Creating serial input task (CPU 1)\n");
+    fflush(stdout);
+    xTaskCreatePinnedToCore(serial_input_task, "serial_input", 2048, NULL, 4, NULL, 1);
+
+    printf("Creating status display task (CPU 1)\n");
+    //fflush(stdout);
+    //vTaskDelay(pdMS_TO_TICKS(10));
+    xTaskCreatePinnedToCore(status_display_task, "status_display", 2048, NULL, 3, NULL, 1);
+    //fflush(stdout);
+    //vTaskDelay(pdMS_TO_TICKS(10));
+
+    vTaskDelete(NULL);
+}
